@@ -61,24 +61,69 @@ logger = logging.getLogger(__name__)
 # Create a FastMCP server
 mcp = FastMCP("A2A Bridge Server")
 
+# Helper to get user identification from context
+def get_user_id(ctx: Context) -> str:
+    """
+    Extract a stable user/session identifier from the MCP context.
+    Prioritizes session_id, then client_id, then metadata, with a fallback.
+    """
+    if not ctx:
+        return "default_user"
+        
+    # 1. Use session_id if available (typical for HTTP/SSE)
+    if hasattr(ctx, "session_id") and ctx.session_id:
+        return f"session_{ctx.session_id}"
+        
+    # 2. Use client_id if provided
+    if hasattr(ctx, "client_id") and ctx.client_id:
+        return f"client_{ctx.client_id}"
+        
+    # 3. Check for metadata in request_context
+    if hasattr(ctx, "request_context") and ctx.request_context:
+        meta = ctx.request_context.meta if hasattr(ctx.request_context, "meta") else None
+        if meta and hasattr(meta, "user_id") and meta.user_id:
+            return f"user_{meta.user_id}"
+            
+    return "default_user"
+
 # File paths for persistent storage
 DATA_DIR = os.environ.get("A2A_MCP_DATA_DIR", ".")
 REGISTERED_AGENTS_FILE = os.path.join(DATA_DIR, "registered_agents.json")
 TASK_AGENT_MAPPING_FILE = os.path.join(DATA_DIR, "task_agent_mapping.json")
 
 # Load stored data from disk if it exists
-stored_agents = load_from_json(REGISTERED_AGENTS_FILE)
-stored_tasks = load_from_json(TASK_AGENT_MAPPING_FILE)
+stored_agents_data = load_from_json(REGISTERED_AGENTS_FILE)
+stored_tasks_data = load_from_json(TASK_AGENT_MAPPING_FILE)
 
 # Initialize in-memory dictionaries with stored data
+# Structure: { user_id: { url/task_id: data } }
 registered_agents = {}
 task_agent_mapping = {}
+
+def initialize_storage():
+    """Initialize in-memory storage from local files."""
+    global registered_agents, task_agent_mapping
+    
+    # Load agents
+    for user_id, user_agents in stored_agents_data.items():
+        registered_agents[user_id] = {
+            url: AgentInfo(**info) for url, info in user_agents.items()
+        }
+            
+    # Load tasks
+    for user_id, user_tasks in stored_tasks_data.items():
+        task_agent_mapping[user_id] = user_tasks
+
+initialize_storage()
 
 # Register function to save data on exit
 def save_data_on_exit():
     logger.info("Saving data before exit...")
     # Convert registered_agents to a serializable format
-    agents_data = {url: agent.model_dump() for url, agent in registered_agents.items()}
+    agents_data = {
+        user_id: {url: agent.model_dump() for url, agent in user_agents.items()}
+        for user_id, user_agents in registered_agents.items()
+    }
     save_to_json(agents_data, REGISTERED_AGENTS_FILE)
     save_to_json(task_agent_mapping, TASK_AGENT_MAPPING_FILE)
     logger.info("Data saved successfully")
@@ -90,7 +135,10 @@ async def periodic_save():
     while True:
         await asyncio.sleep(300)  # 5 minutes
         logger.info("Performing periodic data save...")
-        agents_data = {url: agent.model_dump() for url, agent in registered_agents.items()}
+        agents_data = {
+            user_id: {url: agent.model_dump() for url, agent in user_agents.items()}
+            for user_id, user_agents in registered_agents.items()
+        }
         save_to_json(agents_data, REGISTERED_AGENTS_FILE)
         save_to_json(task_agent_mapping, TASK_AGENT_MAPPING_FILE)
         logger.info("Periodic save completed")
@@ -279,7 +327,7 @@ async def fetch_agent_card(url: str) -> AgentCard:
             pass  # Connection error, try the well-known URL
         
         # Try the well-known location
-        well_known_url = f"{url.rstrip('/')}/.well-known/agent.json"
+        well_known_url = f"{url.rstrip('/')}/.well-known/agent-card.json"
         try:
             response = await client.get(well_known_url)
             if response.status_code == 200:
@@ -318,6 +366,7 @@ async def register_agent(url: str, ctx: Context) -> Dict[str, Any]:
     Returns:
         Dictionary with registration status
     """
+    user_id = get_user_id(ctx)
     try:
         # Fetch the agent card directly
         agent_card = await fetch_agent_card(url)
@@ -329,13 +378,19 @@ async def register_agent(url: str, ctx: Context) -> Dict[str, Any]:
             description=agent_card.description or "No description provided",
         )
         
-        registered_agents[url] = agent_info
+        if user_id not in registered_agents:
+            registered_agents[user_id] = {}
+            
+        registered_agents[user_id][url] = agent_info
         
         # Save to disk immediately
-        agents_data = {url: agent.model_dump() for url, agent in registered_agents.items()}
+        agents_data = {
+            uid: {u: a.model_dump() for u, a in uas.items()}
+            for uid, uas in registered_agents.items()
+        }
         save_to_json(agents_data, REGISTERED_AGENTS_FILE)
         
-        await ctx.info(f"Successfully registered agent: {agent_card.name}")
+        await ctx.info(f"Successfully registered agent: {agent_card.name} for user {user_id}")
         return {
             "status": "success",
             "agent": agent_info.model_dump(),
@@ -348,18 +403,20 @@ async def register_agent(url: str, ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def list_agents() -> List[Dict[str, Any]]:
+async def list_agents(ctx: Context) -> List[Dict[str, Any]]:
     """
-    List all registered A2A agents.
+    List all registered A2A agents for the current user.
     
     Returns:
         List of registered agents
     """
-    return [agent.model_dump() for agent in registered_agents.values()]
+    user_id = get_user_id(ctx)
+    user_agents = registered_agents.get(user_id, {})
+    return [agent.model_dump() for agent in user_agents.values()]
 
 
 @mcp.tool()
-async def unregister_agent(url: str, ctx: Context = None) -> Dict[str, Any]:
+async def unregister_agent(url: str, ctx: Context) -> Dict[str, Any]:
     """
     Unregister an A2A agent from the bridge server.
     
@@ -369,37 +426,42 @@ async def unregister_agent(url: str, ctx: Context = None) -> Dict[str, Any]:
     Returns:
         Dictionary with unregistration status
     """
-    if url not in registered_agents:
+    user_id = get_user_id(ctx)
+    user_agents = registered_agents.get(user_id, {})
+    
+    if url not in user_agents:
         return {
             "status": "error",
-            "message": f"Agent not registered: {url}",
+            "message": f"Agent not registered for this user: {url}",
         }
     
     try:
         # Get agent name before removing it
-        agent_name = registered_agents[url].name
+        agent_name = user_agents[url].name
         
         # Remove from registered agents
-        del registered_agents[url]
+        del user_agents[url]
         
-        # Clean up any task mappings related to this agent
-        # Create a list of task_ids to remove to avoid modifying the dictionary during iteration
+        # Clean up any task mappings related to this agent for this user
+        user_tasks = task_agent_mapping.get(user_id, {})
         tasks_to_remove = []
-        for task_id, agent_url in task_agent_mapping.items():
+        for task_id, agent_url in user_tasks.items():
             if agent_url == url:
                 tasks_to_remove.append(task_id)
         
         # Now remove the task mappings
         for task_id in tasks_to_remove:
-            del task_agent_mapping[task_id]
+            del user_tasks[task_id]
         
         # Save changes to disk immediately
-        agents_data = {url: agent.model_dump() for url, agent in registered_agents.items()}
+        agents_data = {
+            uid: {u: a.model_dump() for u, a in uas.items()}
+            for uid, uas in registered_agents.items()
+        }
         save_to_json(agents_data, REGISTERED_AGENTS_FILE)
         save_to_json(task_agent_mapping, TASK_AGENT_MAPPING_FILE)
         
-        if ctx:
-            await ctx.info(f"Successfully unregistered agent: {agent_name}")
+        await ctx.info(f"Successfully unregistered agent: {agent_name} for user {user_id}")
         
         return {
             "status": "success",
@@ -431,10 +493,13 @@ async def send_message(
     Returns:
         Agent's response with task_id for future reference
     """
-    if agent_url not in registered_agents:
+    user_id = get_user_id(ctx)
+    user_agents = registered_agents.get(user_id, {})
+    
+    if agent_url not in user_agents:
         return {
             "status": "error",
-            "message": f"Agent not registered: {agent_url}",
+            "message": f"Agent not registered for this user: {agent_url}",
         }
     
     # Create a client for the agent
@@ -444,8 +509,10 @@ async def send_message(
         # Generate a task ID
         task_id = str(uuid.uuid4())
         
-        # Store the mapping of task_id to agent_url for later reference
-        task_agent_mapping[task_id] = agent_url
+        # Store the mapping of task_id to agent_url for later reference for this user
+        if user_id not in task_agent_mapping:
+            task_agent_mapping[user_id] = {}
+        task_agent_mapping[user_id][task_id] = agent_url
         
         # Create the message
         a2a_message = Message(
@@ -559,13 +626,16 @@ async def get_task_result(
     Returns:
         Task result including status, message, and artifacts if available
     """
-    if task_id not in task_agent_mapping:
+    user_id = get_user_id(ctx)
+    user_tasks = task_agent_mapping.get(user_id, {})
+    
+    if task_id not in user_tasks:
         return {
             "status": "error",
-            "message": f"Task ID not found: {task_id}",
+            "message": f"Task ID not found for this user: {task_id}",
         }
     
-    agent_url = task_agent_mapping[task_id]
+    agent_url = user_tasks[task_id]
     
     # Create a client for the agent
     client = A2AClient(url=agent_url)
@@ -696,13 +766,16 @@ async def cancel_task(
     Returns:
         Cancellation result
     """
-    if task_id not in task_agent_mapping:
+    user_id = get_user_id(ctx)
+    user_tasks = task_agent_mapping.get(user_id, {})
+    
+    if task_id not in user_tasks:
         return {
             "status": "error",
-            "message": f"Task ID not found: {task_id}",
+            "message": f"Task ID not found for this user: {task_id}",
         }
     
-    agent_url = task_agent_mapping[task_id]
+    agent_url = user_tasks[task_id]
     
     # Create a client for the agent
     client = A2AClient(url=agent_url)
@@ -769,10 +842,13 @@ async def send_message_stream(
     Returns:
         Stream of agent's responses
     """
-    if agent_url not in registered_agents:
+    user_id = get_user_id(ctx)
+    user_agents = registered_agents.get(user_id, {})
+    
+    if agent_url not in user_agents:
         return {
             "status": "error",
-            "message": f"Agent not registered: {agent_url}",
+            "message": f"Agent not registered for this user: {agent_url}",
         }
     
     # Create a client for the agent
@@ -782,8 +858,10 @@ async def send_message_stream(
         # Generate a task ID
         task_id = str(uuid.uuid4())
         
-        # Store the mapping of task_id to agent_url for later reference
-        task_agent_mapping[task_id] = agent_url
+        # Store the mapping of task_id to agent_url for later reference for this user
+        if user_id not in task_agent_mapping:
+            task_agent_mapping[user_id] = {}
+        task_agent_mapping[user_id][task_id] = agent_url
         
         # Save the task mapping to disk
         save_to_json(task_agent_mapping, TASK_AGENT_MAPPING_FILE)
@@ -994,8 +1072,8 @@ async def main_async():
     """
     Main async function to start both the MCP and A2A servers.
     """
-    # Load stored data into memory
-    load_registered_agents()
+    # Data is already loaded at module level via migrate_and_load_data()
+    pass
     
     # Start periodic save task
     asyncio.create_task(periodic_save())
@@ -1037,21 +1115,7 @@ async def main_async():
     await asyncio.gather(a2a_task, mcp_task)
 
 
-def load_registered_agents():
-    """Load registered agents from stored data on startup."""
-    global registered_agents, task_agent_mapping
-    
-    logger.info("Loading saved data...")
-    
-    # Load agents data
-    agents_data = load_from_json(REGISTERED_AGENTS_FILE)
-    for url, agent_data in agents_data.items():
-        registered_agents[url] = AgentInfo(**agent_data)
-    
-    # Load task mappings
-    task_agent_mapping = load_from_json(TASK_AGENT_MAPPING_FILE)
-    
-    logger.info(f"Loaded {len(registered_agents)} agents and {len(task_agent_mapping)} task mappings")
+# Note: initialize_storage() is called at the module level to initialize state.
 
 
 def main():

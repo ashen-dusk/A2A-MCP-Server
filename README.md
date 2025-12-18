@@ -450,7 +450,7 @@ The server provides detailed error messages for common issues:
 
 If an agent can't be registered:
 - Verify the agent URL is correct and accessible
-- Check if the agent has a proper agent card at `/.well-known/agent.json`
+- Check if the agent has a proper agent card at `/.well-known/agent-card.json`
 
 ### Message Delivery Problems
 
