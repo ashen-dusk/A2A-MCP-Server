@@ -98,6 +98,13 @@ class Task(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class AgentInfo(BaseModel):
+    """Information about an A2A agent."""
+    url: str = Field(description="URL of the A2A agent")
+    name: str = Field(description="Name of the A2A agent")
+    description: str = Field(description="Description of the A2A agent")
+
+
 class TaskStatusUpdateEvent(BaseModel):
     id: str
     status: TaskStatus

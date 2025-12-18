@@ -30,6 +30,7 @@ from common.types import (
     AgentCard,
     AgentCapabilities,
     AgentSkill,
+    AgentInfo,
     Artifact,
     DataPart,
     Message,
@@ -106,13 +107,16 @@ def initialize_storage():
     
     # Load agents
     for user_id, user_agents in stored_agents_data.items():
-        registered_agents[user_id] = {
-            url: AgentInfo(**info) for url, info in user_agents.items()
-        }
+        if isinstance(user_agents, dict):
+            registered_agents[user_id] = {
+                url: AgentInfo(**info) for url, info in user_agents.items()
+                if isinstance(info, dict)
+            }
             
     # Load tasks
     for user_id, user_tasks in stored_tasks_data.items():
-        task_agent_mapping[user_id] = user_tasks
+        if isinstance(user_tasks, dict):
+            task_agent_mapping[user_id] = user_tasks
 
 initialize_storage()
 
@@ -163,11 +167,6 @@ if MCP_TRANSPORT not in TRANSPORT_TYPES:
     print(f"Warning: Invalid transport type '{MCP_TRANSPORT}'. Using default: {DEFAULT_TRANSPORT}")
     MCP_TRANSPORT = DEFAULT_TRANSPORT
 
-class AgentInfo(BaseModel):
-    """Information about an A2A agent."""
-    url: str = Field(description="URL of the A2A agent")
-    name: str = Field(description="Name of the A2A agent")
-    description: str = Field(description="Description of the A2A agent")
 
 class A2ABridgeTaskManager(InMemoryTaskManager):
     """Task manager that forwards tasks to A2A agents."""
