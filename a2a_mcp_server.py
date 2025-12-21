@@ -165,7 +165,7 @@ TRANSPORT_TYPES = ["stdio", "streamable-http", "sse"]
 # MCP server configuration
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", DEFAULT_TRANSPORT).lower()
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
-MCP_PORT = int(os.environ.get("MCP_PORT", "8001"))
+MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 MCP_PATH = os.environ.get("MCP_PATH", "/mcp")  # For streamable-http
 MCP_SSE_PATH = os.environ.get("MCP_SSE_PATH", "/sse")  # For sse
 
