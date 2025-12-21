@@ -19,11 +19,15 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 import json
 import logging
 import atexit
+import jwt
+from dotenv import load_dotenv
+from fastmcp.server.context import request_ctx
 
 import httpx
 # Set required environment variable for FastMCP 2.8.1+
 os.environ.setdefault('FASTMCP_LOG_LEVEL', 'INFO')
 from fastmcp import Context, FastMCP
+from fastmcp.server.auth.providers.scalekit import ScalekitProvider
 from pydantic import BaseModel, Field
 
 from common.types import (
@@ -59,33 +63,40 @@ from persistence_utils import save_to_json, load_from_json
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create a FastMCP server
-mcp = FastMCP("A2A Bridge Server")
+load_dotenv()
+
+# Discovers Scalekit endpoints and set up JWT token validation
+auth_provider = ScalekitProvider(
+    environment_url=os.environ.get('SCALEKIT_ENVIRONMENT_URL'),    # Scalekit environment URL
+    resource_id=os.environ.get('SCALEKIT_RESOURCE_ID'),            # Resource server ID
+    base_url=os.environ.get('SERVER_URL'),                         # Public MCP endpoint
+)
+
+mcp = FastMCP(
+    "A2A Bridge Server",
+    auth=auth_provider
+)
 
 # Helper to get user identification from context
-def get_user_id(ctx: Context) -> str:
+def get_user_id() -> str:
     """
-    Extract a stable user/session identifier from the MCP context.
-    Prioritizes session_id, then client_id, then metadata, with a fallback.
+    Extract user ID from the fastmcp request context.
     """
-    if not ctx:
-        return "default_user"
-        
-    # 1. Use session_id if available (typical for HTTP/SSE)
-    if hasattr(ctx, "session_id") and ctx.session_id:
-        return f"session_{ctx.session_id}"
-        
-    # 2. Use client_id if provided
-    if hasattr(ctx, "client_id") and ctx.client_id:
-        return f"client_{ctx.client_id}"
-        
-    # 3. Check for metadata in request_context
-    if hasattr(ctx, "request_context") and ctx.request_context:
-        meta = ctx.request_context.meta if hasattr(ctx.request_context, "meta") else None
-        if meta and hasattr(meta, "user_id") and meta.user_id:
-            return f"user_{meta.user_id}"
-            
-    return "default_user"
+    context = request_ctx.get()
+    if hasattr(context, 'request') and hasattr(context.request, 'headers'):
+        auth_header = context.request.headers.get('authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+            try:
+                claims = jwt.decode(token, options={"verify_signature": False})
+                if 'sub' in claims:
+                    return f"auth_{claims['sub']}"
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Failed to decode token manually: {e}")
+
+    return {"error": "No token found"}
+
 
 # File paths for persistent storage
 DATA_DIR = os.environ.get("A2A_MCP_DATA_DIR", ".")
@@ -148,13 +159,13 @@ async def periodic_save():
         logger.info("Periodic save completed")
 
 # Load transport configuration from environment variables
-DEFAULT_TRANSPORT = "stdio"
+DEFAULT_TRANSPORT = "streamable-http"
 TRANSPORT_TYPES = ["stdio", "streamable-http", "sse"]
 
 # MCP server configuration
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", DEFAULT_TRANSPORT).lower()
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
-MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+MCP_PORT = int(os.environ.get("MCP_PORT", "8001"))
 MCP_PATH = os.environ.get("MCP_PATH", "/mcp")  # For streamable-http
 MCP_SSE_PATH = os.environ.get("MCP_SSE_PATH", "/sse")  # For sse
 
@@ -365,7 +376,7 @@ async def register_agent(url: str, ctx: Context) -> Dict[str, Any]:
     Returns:
         Dictionary with registration status
     """
-    user_id = get_user_id(ctx)
+    user_id = get_user_id()
     try:
         # Fetch the agent card directly
         agent_card = await fetch_agent_card(url)
@@ -409,7 +420,7 @@ async def list_agents(ctx: Context) -> List[Dict[str, Any]]:
     Returns:
         List of registered agents
     """
-    user_id = get_user_id(ctx)
+    user_id = get_user_id()
     user_agents = registered_agents.get(user_id, {})
     return [agent.model_dump() for agent in user_agents.values()]
 
@@ -425,7 +436,7 @@ async def unregister_agent(url: str, ctx: Context) -> Dict[str, Any]:
     Returns:
         Dictionary with unregistration status
     """
-    user_id = get_user_id(ctx)
+    user_id = get_user_id()
     user_agents = registered_agents.get(user_id, {})
     
     if url not in user_agents:
@@ -492,7 +503,7 @@ async def send_message(
     Returns:
         Agent's response with task_id for future reference
     """
-    user_id = get_user_id(ctx)
+    user_id = get_user_id()
     user_agents = registered_agents.get(user_id, {})
     
     if agent_url not in user_agents:
@@ -625,7 +636,7 @@ async def get_task_result(
     Returns:
         Task result including status, message, and artifacts if available
     """
-    user_id = get_user_id(ctx)
+    user_id = get_user_id()
     user_tasks = task_agent_mapping.get(user_id, {})
     
     if task_id not in user_tasks:
@@ -765,7 +776,7 @@ async def cancel_task(
     Returns:
         Cancellation result
     """
-    user_id = get_user_id(ctx)
+    user_id = get_user_id()
     user_tasks = task_agent_mapping.get(user_id, {})
     
     if task_id not in user_tasks:
@@ -841,7 +852,7 @@ async def send_message_stream(
     Returns:
         Stream of agent's responses
     """
-    user_id = get_user_id(ctx)
+    user_id = get_user_id()
     user_agents = registered_agents.get(user_id, {})
     
     if agent_url not in user_agents:
