@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from fastmcp.server.context import request_ctx
 
 import httpx
+import uvicorn
 # Set required environment variable for FastMCP 2.8.1+
 os.environ.setdefault('FASTMCP_LOG_LEVEL', 'INFO')
 from fastmcp import Context, FastMCP
@@ -90,7 +91,7 @@ def get_user_id() -> str:
             try:
                 claims = jwt.decode(token, options={"verify_signature": False})
                 if 'sub' in claims:
-                    return f"auth_{claims['sub']}"
+                    return claims['sub']
             except Exception as e:
                 if logger:
                     logger.warning(f"Failed to decode token manually: {e}")
@@ -1077,56 +1078,50 @@ def setup_a2a_server():
         port=A2A_PORT,
     )
 
+from starlette.applications import Starlette
+from starlette.routing import Mount
 
 async def main_async():
     """
-    Main async function to start both the MCP and A2A servers.
+    Main async function to start A2A, Custom Routes, and MCP.
     """
-    # Data is already loaded at module level via migrate_and_load_data()
-    pass
-    
-    # Start periodic save task
+    # --- 1. Start Background Services ---
     asyncio.create_task(periodic_save())
     
-    # Set up and start the A2A server
     a2a_server = setup_a2a_server()
     a2a_task = asyncio.create_task(a2a_server.start_async())
     
-    # Start the MCP server with the configured transport
-    print(f"Starting MCP server with {MCP_TRANSPORT} transport...")
+    print(f"Starting Server at {MCP_HOST}:{MCP_PORT}...")
+
+    # --- 2. Prepare the MCP Sub-App ---
+    mcp_sub_app = mcp.http_app()
+
+    # --- 3. Define Routes & Mounts ---
+    routes = [
+        Mount("/", app=mcp_sub_app),
+    ]
+
+    # --- 4. Create the Main Starlette App ---
+    root_app = Starlette(
+        routes=routes,
+        lifespan=mcp_sub_app.lifespan 
+    )
+
+    # --- 5. Run Uvicorn with the Root App ---
+    config = uvicorn.Config(
+        app=root_app,
+        host=MCP_HOST,
+        port=MCP_PORT,
+        log_level="info"
+    )
     
-    if MCP_TRANSPORT == "stdio":
-        # Use stdio transport (default)
-        mcp_task = asyncio.create_task(
-            mcp.run_async(transport="stdio")
-        )
-    elif MCP_TRANSPORT == "streamable-http":
-        # Use streamable-http transport
-        mcp_task = asyncio.create_task(
-            mcp.run_async(
-                transport="streamable-http",
-                host=MCP_HOST,
-                port=MCP_PORT,
-                path=MCP_PATH,
-            )
-        )
-    elif MCP_TRANSPORT == "sse":
-        # Use sse transport (deprecated but still supported)
-        mcp_task = asyncio.create_task(
-            mcp.run_async(
-                transport="sse",
-                host=MCP_HOST,
-                port=MCP_PORT,
-                path=MCP_SSE_PATH,
-            )
-        )
-    
-    # Run both servers
-    await asyncio.gather(a2a_task, mcp_task)
+    server = uvicorn.Server(config)
 
-
-# Note: initialize_storage() is called at the module level to initialize state.
-
+    # Run everything together
+    await asyncio.gather(
+        a2a_task,
+        server.serve()
+    )
 
 def main():
     """
@@ -1148,8 +1143,11 @@ def main():
     print(f"- Registered Agents: {REGISTERED_AGENTS_FILE}")
     print(f"- Task Agent Mapping: {TASK_AGENT_MAPPING_FILE}")
     
-    asyncio.run(main_async())
-
+    # Start the async loop
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\nShutting down servers...")
 
 if __name__ == "__main__":
     main()
